@@ -1,0 +1,675 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vilankulo – Bilene bush roads</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    body { font: 14px system-ui, sans-serif; }
+    .panel { background: rgba(255,255,255,.94); padding: 10px 12px; border-radius: 4px; box-shadow: 0 1px 5px #777; max-width: 300px; }
+    .panel h1 { font-size: 16px; margin: 0 0 6px; }
+    .panel p { margin: 5px 0; line-height: 1.35; }
+    .panel button { margin: 7px 5px 0 0; padding: 5px 8px; }
+    .panel button.primary { background:#1867c0; color:#fff; border:1px solid #0c4e95; }
+    .panel button.danger { color:#a00; }
+    .drag-handle { cursor: move; user-select: none; margin: -2px -4px 8px; padding: 5px 7px; background: #f0f0f0; border-radius: 3px; font-weight: 700; }
+    .legend i { display:inline-block; width:23px; height:3px; vertical-align:middle; margin-right:6px; }
+    #status { color:#555; font-size:12px; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  // Coastal corridor from Vilankulo to Bilene, including the N1-side interior.
+  const area = L.latLngBounds([[-25.48, 33.22], [-21.82, 35.88]]);
+  const map = L.map('map', { maxBounds: area.pad(.12), maxBoundsViscosity: .8 }).fitBounds(area);
+  const roads = L.layerGroup().addTo(map);
+  const tracedRoads = L.featureGroup().addTo(map);
+  let route, firstPoint, secondPoint, firstMarker, secondMarker, loadedKey = '';
+  let routePoints = [], routeDistance = 0, routeDuration = 0, routeInFlight = false;
+  let drawMode = false, draftPoints = [], draftLine, selectedTrace, editingTraceId = null;
+  let extendingTraceId = null, extensionMarker, selectedStartMarker, selectedEndMarker, correctionPointer, correctionTraceId = null, correctionPointIndex = null;
+  let undoStack = [];
+  const traceStorageKey = 'vilankulo-bilene-road-traces-v1';
+  let savedTraces = [];
+
+  // Free OSM road tiles; no API key is required.
+  const base = L.tileLayer('https://{s}.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png', {
+    maxZoom: 20, subdomains: 'abc',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a> &mdash; OSM France'
+  });
+  const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 19, attribution: 'Tiles &copy; Esri'
+  });
+  L.control.layers(
+    { 'Road map — OpenStreetMap': base, 'Satellite — real ground view': satellite },
+    { 'R — mapped small roads & bush tracks': roads, 'Your saved road lines': tracedRoads }
+  ).addTo(map);
+  L.control.scale({ imperial:false, position:'bottomleft' }).addTo(map);
+
+  const info = L.control({position:'topright'});
+  info.onAdd = () => {
+    const el = L.DomUtil.create('div', 'panel');
+    el.innerHTML = `<div id="menuHandle" class="drag-handle" title="Drag this menu to another place on the screen">Move menu</div>
+      <h1>Vilankulo – Bilene bush roads</h1>
+      <p><b>Satellite is selected:</b> it shows the real ground, including visible bush tracks. Use the layers icon at upper right for the free OpenStreetMap road map.</p>
+      <p><b>R layer:</b> mapped small roads and tracks, drawn over the imagery. Turn it on with the layers icon after zooming in. The scale at lower left is in kilometres/metres.</p>
+      <p><b>Trace a road:</b> start drawing, click along the road, pan/zoom as needed, then finish. Your lines save on this device.</p>
+      <button id="draw" class="primary">Start drawing</button><button id="finish">Finish line</button><button id="cancel">Cancel line</button>
+      <button id="continue" class="primary">Continue selected as OSRM</button><button id="undo">Undo previous action</button>
+      <button id="trimBefore" class="danger">Trim before pointer</button><button id="trim" class="danger">Trim after pointer</button>
+      <button id="snap">Follow OSM road</button><button id="delete" class="danger">Delete selected</button>
+      <button id="saveRoute">Save blue OSRM route</button><button id="joinPair">Join selected + nearest</button><button id="join">Join red lines</button>
+      <button id="export">Export saved lines</button><button id="exportKml">Export Google Maps line</button><button id="import">Import lines</button>
+      <input id="importFile" type="file" accept=".geojson,.json" hidden>
+      <p><b>OSRM routing:</b> when not drawing, click a start point, then keep clicking destinations. Each click extends the same blue route along mapped roads.</p>
+      <button id="clear">Clear blue route</button><button id="clearMap" class="danger">Clear map</button>
+      <p id="status">Satellite view loaded. Zoom in to inspect bush roads.</p>`;
+    L.DomEvent.disableClickPropagation(el); return el;
+  };
+  info.addTo(map);
+  function makeMenuDraggable(panel) {
+    const handle = panel.querySelector('#menuHandle');
+    if (!handle) return;
+    panel.style.position = 'fixed';
+    panel.style.top = '78px';
+    panel.style.right = '16px';
+    panel.style.zIndex = '10000';
+    let dragging = false, offsetX = 0, offsetY = 0;
+    handle.addEventListener('pointerdown', e => {
+      dragging = true;
+      const rect = panel.getBoundingClientRect();
+      panel.style.left = rect.left + 'px';
+      panel.style.top = rect.top + 'px';
+      panel.style.right = 'auto';
+      offsetX = e.clientX - rect.left;
+      offsetY = e.clientY - rect.top;
+      handle.setPointerCapture(e.pointerId);
+      e.preventDefault();
+    });
+    handle.addEventListener('pointermove', e => {
+      if (!dragging) return;
+      const x = Math.max(0, Math.min(window.innerWidth - panel.offsetWidth, e.clientX - offsetX));
+      const y = Math.max(0, Math.min(window.innerHeight - panel.offsetHeight, e.clientY - offsetY));
+      panel.style.left = x + 'px';
+      panel.style.top = y + 'px';
+    });
+    handle.addEventListener('pointerup', e => {
+      dragging = false;
+      handle.releasePointerCapture(e.pointerId);
+    });
+    handle.addEventListener('pointercancel', () => { dragging = false; });
+  }
+  makeMenuDraggable(info.getContainer());
+  const places = [
+    ['Vilankulo', -21.999, 35.318],
+    ['Pomene', -22.914, 35.586],
+    ['Inhambane / Maxixe', -23.865, 35.385],
+    ['Xai-Xai', -25.052, 33.644],
+    ['Bilene', -25.284, 33.515]
+  ];
+  const placeLayer = L.layerGroup(places.map(([name,lat,lng]) =>
+    L.circleMarker([lat,lng], {radius:6,color:'#111',weight:2,fillColor:'#ffe45c',fillOpacity:1})
+      .bindTooltip(name, {permanent:false, direction:'top'})
+  )).addTo(map);
+  L.control.layers(null, { 'Location markers': placeLayer }, {position:'topleft'}).addTo(map);
+
+  function roadStyle(tags) {
+    const h = tags.highway || '';
+    if (['trunk','primary'].includes(h)) return {color:'#e4572e',weight:5,opacity:.95};
+    if (['secondary','tertiary'].includes(h)) return {color:'#f3a712',weight:4,opacity:.9};
+    if (['unclassified','residential'].includes(h)) return {color:'#fff3b0',weight:3,opacity:1};
+    if (h === 'track') return {color:'#9a7b4f',weight:2,opacity:.95,dashArray:'5 3'};
+    if (h === 'path') return {color:'#895b8a',weight:1.5,opacity:.9,dashArray:'2 4'};
+    return {color:'#879a6a',weight:2,opacity:.9}; // service and other minor ways
+  }
+  function clearRoute() {
+    [route, firstMarker, secondMarker].forEach(x => x && map.removeLayer(x));
+    route = firstMarker = secondMarker = undefined; firstPoint = secondPoint = undefined;
+    routePoints = []; routeDistance = 0; routeDuration = 0; routeInFlight = false;
+    document.getElementById('status').textContent = 'Route cleared. Click two locations to route.';
+  }
+  function clearBlueRoute() {
+    if (!firstPoint && !routePoints.length) { document.getElementById('status').textContent='There is no blue route to clear.'; return; }
+    rememberAction('clear blue route');
+    clearRoute();
+  }
+  function cloneTraces(traces) {
+    return JSON.parse(JSON.stringify(traces));
+  }
+  function captureRouteState() {
+    return {
+      firstPoint:firstPoint ? [firstPoint.lat, firstPoint.lng] : null,
+      routePoints:routePoints.map(p => [p[0], p[1]]),
+      routeDistance,
+      routeDuration
+    };
+  }
+  function restoreRouteState(state) {
+    if (!state) return;
+    routePoints = (state.routePoints || []).map(p => [p[0], p[1]]);
+    routeDistance = state.routeDistance || 0;
+    routeDuration = state.routeDuration || 0;
+    firstPoint = state.firstPoint ? L.latLng(state.firstPoint[0], state.firstPoint[1]) : undefined;
+    secondPoint = routePoints.length ? L.latLng(routePoints[routePoints.length - 1][0], routePoints[routePoints.length - 1][1]) : undefined;
+    if (firstPoint) {
+      firstMarker = L.marker(firstPoint).addTo(map).bindTooltip('Start of the temporary blue OSRM route. Click a destination to draw the first section.');
+      explainOnHover(firstMarker, 'Start marker = beginning of the temporary blue OSRM route.');
+    }
+    if (routePoints.length > 1) {
+      route = L.polyline(routePoints,{color:'#1967d2',weight:5,opacity:.85}).addTo(map);
+      route.bindTooltip('Blue OSRM route: temporary route following mapped OSM roads. Save it if you want it as a red line.', {sticky:true});
+      explainOnHover(route, 'Blue line = temporary OSRM route. Use Save blue OSRM route to keep it as a red saved road.');
+      secondMarker = L.marker(secondPoint).addTo(map).bindTooltip('Current end of the blue OSRM route. Click another destination to extend the blue route.');
+      explainOnHover(secondMarker, 'Blue marker = current end of the temporary blue OSRM route.');
+    }
+  }
+  function rememberAction(label) {
+    undoStack.push({label, traces:cloneTraces(savedTraces), selectedTrace, routeState:captureRouteState()});
+    if (undoStack.length > 50) undoStack.shift();
+  }
+  function restoreLastAction() {
+    const previous = undoStack.pop();
+    if (!previous) { document.getElementById('status').textContent='There is no previous action to undo.'; return; }
+    stopTraceExtension('');
+    cancelDrawing('');
+    clearRoute();
+    restoreRouteState(previous.routeState);
+    savedTraces = cloneTraces(previous.traces);
+    selectedTrace = savedTraces.some(t => t.id === previous.selectedTrace) ? previous.selectedTrace : null;
+    correctionTraceId = null; correctionPointIndex = null;
+    if (correctionPointer) map.removeLayer(correctionPointer);
+    correctionPointer = null;
+    saveTraces(); renderTraces(); updateSelectedEndpointMarkers(getTrace(selectedTrace));
+    document.getElementById('status').textContent = `Undid: ${previous.label}.`;
+  }
+  function clearMap() {
+    if (!savedTraces.length && !routePoints.length && !firstPoint) { document.getElementById('status').textContent='The map is already clear.'; return; }
+    rememberAction('clear map');
+    stopTraceExtension('');
+    cancelDrawing('');
+    clearRoute();
+    savedTraces = []; selectedTrace = null;
+    correctionTraceId = null; correctionPointIndex = null;
+    if (correctionPointer) map.removeLayer(correctionPointer);
+    correctionPointer = null;
+    updateSelectedEndpointMarkers(null);
+    saveTraces(); renderTraces();
+    document.getElementById('status').textContent = 'Map cleared. Use Undo previous action to restore the red lines.';
+  }
+  function explainOnHover(layer, text) {
+    layer.on('mouseover', () => { document.getElementById('status').textContent = text; });
+  }
+  function downloadText(filename, text, type) {
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(new Blob([text], {type}));
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  }
+  function escapeXml(value) {
+    return String(value).replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;'}[c]));
+  }
+  function pointDistance(a, b) {
+    return map.distance(L.latLng(a[0], a[1]), L.latLng(b[0], b[1]));
+  }
+  function northernEndOf(trace) {
+    const first = trace.points[0], last = trace.points[trace.points.length - 1];
+    return first[0] >= last[0] ? first : last;
+  }
+  function buildJoinedTraceResult(traces) {
+    const usable = traces.filter(t => t.points && t.points.length >= 2)
+      .map(t => ({trace:t, points:t.points.map(p => [p[0], p[1]])}));
+    if (!usable.length) return {points:[], gaps:[]};
+    let startIndex = 0, startLat = -Infinity;
+    usable.forEach((item, i) => {
+      const lat = northernEndOf(item).lat || northernEndOf(item)[0];
+      if (lat > startLat) { startLat = lat; startIndex = i; }
+    });
+    const ordered = [], gaps = [];
+    let current = usable.splice(startIndex, 1)[0].points;
+    if (current[current.length - 1][0] > current[0][0]) current = current.slice().reverse();
+    ordered.push(...current);
+    while (usable.length) {
+      const end = ordered[ordered.length - 1];
+      let bestIndex = 0, bestReverse = false, bestDistance = Infinity;
+      usable.forEach((item, i) => {
+        const firstDistance = pointDistance(end, item.points[0]);
+        const lastDistance = pointDistance(end, item.points[item.points.length - 1]);
+        if (firstDistance < bestDistance) { bestDistance = firstDistance; bestIndex = i; bestReverse = false; }
+        if (lastDistance < bestDistance) { bestDistance = lastDistance; bestIndex = i; bestReverse = true; }
+      });
+      let next = usable.splice(bestIndex, 1)[0].points;
+      if (bestReverse) next = next.slice().reverse();
+      const joinDistance = pointDistance(ordered[ordered.length - 1], next[0]);
+      if (joinDistance > 50) gaps.push(joinDistance);
+      if (joinDistance < 2) next = next.slice(1);
+      ordered.push(...next);
+    }
+    return {points:ordered, gaps};
+  }
+  function buildJoinedTracePoints(traces) {
+    return buildJoinedTraceResult(traces).points;
+  }
+  function updateExtensionMarker(trace) {
+    if (extensionMarker) map.removeLayer(extensionMarker);
+    extensionMarker = null;
+    if (!trace || !trace.points.length) return;
+    const end = trace.points[trace.points.length - 1];
+    extensionMarker = L.circleMarker(end, {
+      radius:10, color:'#fff', weight:3, fillColor:'#00b050', fillOpacity:1
+    }).addTo(map).bindTooltip(
+      'Green start point: OSRM extension begins here. Click farther along the road to add the next connected section.',
+      {permanent:true, direction:'top'}
+    );
+    explainOnHover(extensionMarker, 'Green point = current end of the red saved road. With OSRM extension ON, your next map click extends from here.');
+  }
+  function stopTraceExtension(message='OSRM extension stopped.') {
+    extendingTraceId = null;
+    if (extensionMarker) map.removeLayer(extensionMarker);
+    extensionMarker = null;
+    document.getElementById('continue').textContent = 'Continue selected as OSRM';
+    document.getElementById('continue').classList.add('primary');
+    document.getElementById('status').textContent = message;
+  }
+  function updateSelectedEndpointMarkers(trace) {
+    [selectedStartMarker, selectedEndMarker].forEach(x => x && map.removeLayer(x));
+    selectedStartMarker = selectedEndMarker = null;
+    if (!trace || !trace.points || trace.points.length < 2) return;
+    selectedStartMarker = L.circleMarker(trace.points[0], {
+      radius:7, color:'#111', weight:2, fillColor:'#fff', fillOpacity:1
+    }).addTo(map).bindTooltip('Start of selected red line', {permanent:false});
+    selectedEndMarker = L.circleMarker(trace.points[trace.points.length - 1], {
+      radius:7, color:'#111', weight:2, fillColor:'#e00032', fillOpacity:1
+    }).addTo(map).bindTooltip('End of selected red line', {permanent:false});
+    explainOnHover(selectedStartMarker, 'White marker = start of the selected red line.');
+    explainOnHover(selectedEndMarker, 'Red marker = end of the selected red line. OSRM extension starts from this end.');
+  }
+  function traceStyle(selected=false) {
+    return {color:selected ? '#ffea00' : '#e00032', weight:selected ? 7 : 5, opacity:.95};
+  }
+  function saveTraces() {
+    localStorage.setItem(traceStorageKey, JSON.stringify(savedTraces));
+  }
+  function getTrace(id) { return savedTraces.find(t => t.id === id); }
+  function addTraceToMap(trace) {
+    const line = L.polyline(trace.points, traceStyle(false)).addTo(tracedRoads);
+    line.traceId = trace.id;
+    line.bindTooltip(`${trace.name}<br>Red saved road. Click it first, then use Continue selected as OSRM to extend it.`, {sticky:true});
+    explainOnHover(line, 'Red line = your saved road. Click it to select it; then click Continue selected as OSRM to extend from its end.');
+    line.on('click', e => {
+      if (!drawMode) {
+        selectTrace(line.traceId);
+        setCorrectionPointer(line.traceId, e.latlng);
+        L.DomEvent.stopPropagation(e.originalEvent);
+      }
+    });
+    return line;
+  }
+  function renderTraces() {
+    tracedRoads.clearLayers();
+    savedTraces.forEach(addTraceToMap);
+    if (selectedTrace) selectTrace(selectedTrace);
+  }
+  function selectTrace(id) {
+    selectedTrace = id;
+    tracedRoads.eachLayer(line => line.setStyle(traceStyle(line.traceId === id)));
+    const trace = getTrace(id);
+    updateSelectedEndpointMarkers(trace);
+    if (trace) document.getElementById('status').textContent = `Selected: ${trace.name} (${trace.points.length} points). White dot=start, red dot=end.`;
+  }
+  function nearestTracePoint(trace, point) {
+    let nearest = 0, distance = Infinity;
+    trace.points.forEach((p,i) => {
+      const candidate = map.latLngToLayerPoint([p[0],p[1]]);
+      const target = map.latLngToLayerPoint(point);
+      const d = candidate.distanceTo(target);
+      if (d < distance) { distance = d; nearest = i; }
+    });
+    return nearest;
+  }
+  function setCorrectionPointer(id, point) {
+    const trace = getTrace(id); if (!trace) return;
+    correctionTraceId = id; correctionPointIndex = nearestTracePoint(trace, point);
+    const p = trace.points[correctionPointIndex];
+    if (correctionPointer) map.removeLayer(correctionPointer);
+    correctionPointer = L.circleMarker(p, {radius:8,color:'#111',weight:2,fillColor:'#ff9500',fillOpacity:1}).addTo(map).bindTooltip('Orange correction point: trim after this point if you want to redraw the rest.', {permanent:false});
+    explainOnHover(correctionPointer, 'Orange point = correction point. Use Trim after pointer to remove the red line after this point.');
+    document.getElementById('status').textContent = `Correction pointer set on ${trace.name}. Trim after it to redraw the remaining section.`;
+  }
+  function saveTraceHistory(trace) {
+    trace.history = trace.history || [];
+    trace.history.push(trace.points.map(p => [p[0],p[1]]));
+    if (trace.history.length > 30) trace.history.shift();
+  }
+  function updateDrawButtons() {
+    document.getElementById('draw').textContent = drawMode ? 'Drawing: click road' : 'Start drawing';
+    document.getElementById('draw').classList.toggle('primary', !drawMode);
+  }
+  function beginDrawing(points=[], replacingId=null) {
+    stopTraceExtension('');
+    clearRoute();
+    drawMode = true; editingTraceId = replacingId; draftPoints = points.map(p => L.latLng(p));
+    map.doubleClickZoom.disable();
+    if (draftLine) map.removeLayer(draftLine);
+    draftLine = L.polyline(draftPoints, {color:'#00a5ff',weight:5,dashArray:'8 6'}).addTo(map);
+    draftLine.bindTooltip('Blue dashed draft line: manual drawing. Click bends in the visible road, then Finish line.', {sticky:true});
+    explainOnHover(draftLine, 'Blue dashed line = manual drawing before it is saved as a red road line.');
+    updateDrawButtons();
+    document.getElementById('status').textContent = draftPoints.length ? 'Continuing line: click more points, then Finish line.' : 'Drawing road: click each bend, then Finish line.';
+  }
+  function cancelDrawing(message='Line cancelled.') {
+    drawMode = false; editingTraceId = null; draftPoints = [];
+    if (draftLine) map.removeLayer(draftLine);
+    draftLine = undefined; map.doubleClickZoom.enable(); updateDrawButtons();
+    document.getElementById('status').textContent = message;
+  }
+  function finishDrawing() {
+    if (!drawMode || draftPoints.length < 2) {
+      document.getElementById('status').textContent = 'A road line needs at least two points.';
+      return;
+    }
+    let trace = editingTraceId ? getTrace(editingTraceId) : null;
+    rememberAction(trace ? 'replace drawn red line' : 'save new red line');
+    if (trace) {
+      trace.points = draftPoints.map(p => [p.lat,p.lng]);
+    } else {
+      trace = {id:String(Date.now()), name:`Road line ${savedTraces.length + 1}`, points:draftPoints.map(p => [p.lat,p.lng])};
+      savedTraces.push(trace);
+    }
+    saveTraces(); selectedTrace = trace.id; cancelDrawing(`${trace.name} saved. Select it later to continue or delete it.`);
+    renderTraces();
+  }
+  function deleteSelectedTrace() {
+    if (!selectedTrace) { document.getElementById('status').textContent='Click one of your red road lines first.'; return; }
+    const trace = getTrace(selectedTrace);
+    rememberAction(`delete ${trace.name}`);
+    savedTraces = savedTraces.filter(t => t.id !== selectedTrace);
+    selectedTrace = null; updateSelectedEndpointMarkers(null); saveTraces(); renderTraces();
+    document.getElementById('status').textContent = `${trace.name} deleted.`;
+  }
+  async function snapSelectedTraceToOSRM() {
+    const trace = getTrace(selectedTrace);
+    if (!trace) { document.getElementById('status').textContent='Click one of your red road lines first.'; return; }
+    if (trace.points.length > 100) { document.getElementById('status').textContent='This line has too many points to send to OSRM at once.'; return; }
+    document.getElementById('status').textContent='Finding the mapped OSRM road between your points…';
+    try {
+      const coordinates = trace.points.map(p => `${p[1]},${p[0]}`).join(';');
+      const url=`https://router.project-osrm.org/route/v1/driving/${coordinates}?overview=full&geometries=geojson&steps=false`;
+      const response = await fetch(url);
+      if (!response.ok) throw Error('OSRM returned '+response.status);
+      const data = await response.json();
+      if (!data.routes || !data.routes.length) throw Error('no route');
+      rememberAction(`make ${trace.name} follow OSM road`);
+      trace.points = data.routes[0].geometry.coordinates.map(p => [p[1],p[0]]);
+      saveTraces(); renderTraces(); selectTrace(trace.id);
+      document.getElementById('status').textContent = `${trace.name} now follows the mapped OSRM road (${(data.routes[0].distance/1000).toFixed(1)} km).`;
+    } catch (e) {
+      document.getElementById('status').textContent='OSRM could not find a mapped driving road for this line. Trace the visible road manually with more points.';
+    }
+  }
+  function beginTraceExtension() {
+    const trace = getTrace(selectedTrace);
+    if (!trace) { document.getElementById('status').textContent='Click a red saved/imported line first.'; return; }
+    if (extendingTraceId === trace.id) {
+      stopTraceExtension();
+      return;
+    }
+    cancelDrawing(''); clearRoute(); extendingTraceId = trace.id;
+    document.getElementById('continue').textContent = 'OSRM extension ON - click next point';
+    document.getElementById('continue').classList.add('primary');
+    const end = trace.points[trace.points.length - 1];
+    updateExtensionMarker(trace);
+    document.getElementById('status').textContent = `Continuing ${trace.name} from the green marker. Click a new point farther along the road; each click adds one connected OSRM section.`;
+    map.panTo(end);
+  }
+  async function extendTraceWithOSRM(destination) {
+    const trace = getTrace(extendingTraceId);
+    if (!trace || routeInFlight) return;
+    routeInFlight = true;
+    document.getElementById('status').textContent = 'Adding a connected OSRM section to the saved road…';
+    try {
+      const start = trace.points[trace.points.length - 1];
+      const url=`https://router.project-osrm.org/route/v1/driving/${start[1]},${start[0]};${destination.lng},${destination.lat}?overview=full&geometries=geojson`;
+      const response = await fetch(url);
+      if (!response.ok) throw Error('OSRM returned '+response.status);
+      const data = await response.json();
+      if (!data.routes || !data.routes.length) throw Error('no route');
+      const segment = data.routes[0].geometry.coordinates.map(p => [p[1],p[0]]);
+      segment.shift();
+      if (!segment.length) {
+        document.getElementById('status').textContent = 'That click was already on the current end point. Click farther along the road to extend it.';
+        return;
+      }
+      rememberAction(`extend ${trace.name}`);
+      saveTraceHistory(trace); trace.points.push(...segment); saveTraces(); renderTraces(); selectTrace(trace.id); updateExtensionMarker(trace);
+      document.getElementById('status').textContent = `${trace.name} extended by ${(data.routes[0].distance/1000).toFixed(1)} km. The green marker moved to the new end; click the next point to continue.`;
+    } catch (e) {
+      document.getElementById('status').textContent = 'OSRM could not find a road to that point. The saved line was not changed.';
+    } finally { routeInFlight = false; }
+  }
+  function trimTraceAfterPointer() {
+    const trace = getTrace(selectedTrace);
+    if (!trace || correctionTraceId !== selectedTrace || correctionPointIndex === null) { document.getElementById('status').textContent='Click the red line where the correction must begin first.'; return; }
+    if (correctionPointIndex >= trace.points.length - 1) { document.getElementById('status').textContent='The pointer is already at the end of this line.'; return; }
+    rememberAction(`trim after pointer on ${trace.name}`);
+    saveTraceHistory(trace); trace.points = trace.points.slice(0, correctionPointIndex + 1); saveTraces();
+    if (correctionPointer) map.removeLayer(correctionPointer);
+    correctionPointer = null; correctionTraceId = null; correctionPointIndex = null;
+    renderTraces(); selectTrace(trace.id);
+    document.getElementById('status').textContent = `Removed the section after the pointer. Click Continue selected as OSRM to rebuild it.`;
+  }
+  function trimTraceBeforePointer() {
+    const trace = getTrace(selectedTrace);
+    if (!trace || correctionTraceId !== selectedTrace || correctionPointIndex === null) { document.getElementById('status').textContent='Click the red line where the remaining good section must start.'; return; }
+    if (correctionPointIndex <= 0) { document.getElementById('status').textContent='The pointer is already at the start of this line.'; return; }
+    rememberAction(`trim before pointer on ${trace.name}`);
+    saveTraceHistory(trace); trace.points = trace.points.slice(correctionPointIndex); saveTraces();
+    if (correctionPointer) map.removeLayer(correctionPointer);
+    correctionPointer = null; correctionTraceId = null; correctionPointIndex = null;
+    renderTraces(); selectTrace(trace.id);
+    document.getElementById('status').textContent = `Removed the section before the pointer. The selected red line now starts at that point.`;
+  }
+  function exportTraces() {
+    const collection = {type:'FeatureCollection', features:savedTraces.map(t => ({type:'Feature',properties:{name:t.name},geometry:{type:'LineString',coordinates:t.points.map(p=>[p[1],p[0]])}}))};
+    downloadText('vilankulo-bilene-road-traces.geojson', JSON.stringify(collection,null,2), 'application/geo+json');
+    document.getElementById('status').textContent = `${savedTraces.length} saved line(s) exported as GeoJSON.`;
+  }
+  function joinRedLines() {
+    const pieces = savedTraces.filter(t => t.points && t.points.length >= 2 && !/^Joined road /.test(t.name));
+    if (pieces.length < 2) { document.getElementById('status').textContent='Import or save at least two red line stretches before joining.'; return; }
+    const result = buildJoinedTraceResult(pieces);
+    if (result.points.length < 2) { document.getElementById('status').textContent='The red line stretches could not be joined.'; return; }
+    rememberAction('join red lines');
+    const trace = {id:String(Date.now()), name:`Joined road ${savedTraces.length + 1}`, points:result.points};
+    savedTraces.push(trace); selectedTrace = trace.id; saveTraces(); renderTraces(); selectTrace(trace.id);
+    const gapText = result.gaps.length ? ` Warning: ${result.gaps.length} gap(s) were joined by straight connector lines; trim and redraw those missing sections.` : '';
+    document.getElementById('status').textContent = `${trace.name} created from ${pieces.length} red stretches. Original pieces were kept.${gapText}`;
+  }
+  function joinSelectedToNearest() {
+    const trace = getTrace(selectedTrace);
+    if (!trace) { document.getElementById('status').textContent='Click the red line you want to join first.'; return; }
+    const others = savedTraces.filter(t => t.id !== trace.id && t.points && t.points.length >= 2);
+    if (!others.length) { document.getElementById('status').textContent='There is no other red line to join to the selected line.'; return; }
+    const ends = [trace.points[0], trace.points[trace.points.length - 1]];
+    let nearest = others[0], bestDistance = Infinity;
+    others.forEach(other => [other.points[0], other.points[other.points.length - 1]].forEach(p => {
+      const d = Math.min(pointDistance(ends[0], p), pointDistance(ends[1], p));
+      if (d < bestDistance) { bestDistance = d; nearest = other; }
+    }));
+    const result = buildJoinedTraceResult([trace, nearest]);
+    if (result.points.length < 2) { document.getElementById('status').textContent='The two red sections could not be joined.'; return; }
+    rememberAction(`join ${trace.name} to nearest`);
+    const joined = {id:String(Date.now()), name:`Joined pair ${savedTraces.length + 1}`, points:result.points};
+    savedTraces.push(joined); selectedTrace = joined.id; saveTraces(); renderTraces(); selectTrace(joined.id);
+    const gapText = result.gaps.length ? ` Gap between sections is about ${(Math.max(...result.gaps)/1000).toFixed(2)} km, so a straight connector is visible until you redraw that missing piece.` : '';
+    document.getElementById('status').textContent = `${joined.name} created from ${trace.name} and ${nearest.name}.${gapText}`;
+  }
+  function exportGoogleMapsLine() {
+    let trace = getTrace(selectedTrace);
+    if (!trace) {
+      const joinedPoints = buildJoinedTracePoints(savedTraces);
+      if (joinedPoints.length >= 2) trace = {name:'Joined Vilankulo Bilene road', points:joinedPoints};
+    }
+    if (!trace || !trace.points || trace.points.length < 2) { document.getElementById('status').textContent='Select a red line first, or join red lines before exporting for Google Maps.'; return; }
+    const coordinates = trace.points.map(p => `${p[1]},${p[0]},0`).join('\n');
+    const kml = `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>${escapeXml(trace.name)}</name>
+    <Style id="redRoad">
+      <LineStyle><color>ff3200e0</color><width>5</width></LineStyle>
+    </Style>
+    <Placemark>
+      <name>${escapeXml(trace.name)}</name>
+      <styleUrl>#redRoad</styleUrl>
+      <LineString>
+        <tessellate>1</tessellate>
+        <coordinates>
+${coordinates}
+        </coordinates>
+      </LineString>
+    </Placemark>
+  </Document>
+</kml>`;
+    downloadText('vilankulo-bilene-google-maps-line.kml', kml, 'application/vnd.google-earth.kml+xml');
+    document.getElementById('status').textContent = `${trace.name} exported as KML. Import that file into Google My Maps to view it on another browser.`;
+  }
+  function saveCurrentRoute() {
+    if (routePoints.length < 2) { document.getElementById('status').textContent='Build a blue OSRM route first, then save it.'; return; }
+    rememberAction('save blue OSRM route');
+    const trace = {id:String(Date.now()), name:`OSRM route ${savedTraces.length + 1}`, points:routePoints.map(p => [p[0],p[1]])};
+    savedTraces.push(trace); selectedTrace = trace.id; saveTraces(); renderTraces();
+    document.getElementById('status').textContent = `${trace.name} saved as a red line. It will now be included in exports.`;
+  }
+  function importTraces(file) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const geo = JSON.parse(reader.result);
+        let features = geo.type === 'FeatureCollection' ? geo.features : [geo];
+        features = features.flatMap(f => {
+          if (f.type === 'LineString') return [{type:'Feature', properties:{}, geometry:f}];
+          if (f.type === 'MultiLineString') return f.coordinates.map((coords,i) => ({type:'Feature',properties:{name:`Imported road ${i+1}`},geometry:{type:'LineString',coordinates:coords}}));
+          if (f.geometry && f.geometry.type === 'MultiLineString') return f.geometry.coordinates.map((coords,i) => ({type:'Feature',properties:{...f.properties,name:(f.properties&&f.properties.name ? `${f.properties.name} ${i+1}` : `Imported road ${i+1}`)},geometry:{type:'LineString',coordinates:coords}}));
+          return [f];
+        });
+        const additions = features.filter(f => f.geometry && f.geometry.type === 'LineString' && Array.isArray(f.geometry.coordinates) && f.geometry.coordinates.length > 1)
+          .map((f,i) => ({id:String(Date.now()+i), name:(f.properties&&f.properties.name) || `Imported road ${i+1}`, points:f.geometry.coordinates.filter(p=>Array.isArray(p) && p.length >= 2).map(p=>[Number(p[1]),Number(p[0])])}))
+          .filter(t => t.points.length > 1 && t.points.every(p => Number.isFinite(p[0]) && Number.isFinite(p[1])));
+        if (!additions.length) throw Error('No line features found');
+        rememberAction('import lines');
+        savedTraces.push(...additions); saveTraces(); renderTraces();
+        document.getElementById('status').textContent = `${additions.length} road line(s) imported and saved.`;
+      } catch (e) { document.getElementById('status').textContent = `Could not import: ${e.message}. Choose a GeoJSON line or route file.`; }
+    };
+    reader.onerror = () => { document.getElementById('status').textContent = 'Could not read the selected file.'; };
+    reader.readAsText(file);
+  }
+  function loadRoads(force=false) {
+    if (map.getZoom() < 11) {
+      document.getElementById('status').textContent='Zoom in closer before loading the R layer.';
+      return;
+    }
+    const b = map.getBounds();
+    const south=Math.max(b.getSouth(),area.getSouth()), west=Math.max(b.getWest(),area.getWest());
+    const north=Math.min(b.getNorth(),area.getNorth()), east=Math.min(b.getEast(),area.getEast());
+    const key=[south.toFixed(3),west.toFixed(3),north.toFixed(3),east.toFixed(3)].join(',');
+    if (!force && key === loadedKey) return;
+    loadedKey=key; roads.clearLayers();
+    document.getElementById('status').textContent='Loading mapped roads and bush tracks…';
+    // Includes every OSM highway class so small access tracks are visible when they have been mapped.
+    const query=`[out:json][timeout:90];way[highway](${south},${west},${north},${east});out geom tags;`;
+    fetch('https://overpass-api.de/api/interpreter?data=' + encodeURIComponent(query))
+      .then(r => { if(!r.ok) throw Error('Overpass returned '+r.status); return r.json(); })
+      .then(data => {
+        data.elements.forEach(w => {
+          if (!w.geometry) return;
+          const roadName = (w.tags&&w.tags.name) || (w.tags&&w.tags.highway) || 'mapped road';
+          const roadLine = L.polyline(w.geometry.map(p=>[p.lat,p.lon]), roadStyle(w.tags||{}))
+            .bindTooltip(`${roadName}<br>R layer: road/track already mapped in OpenStreetMap.`, {sticky:true}).addTo(roads);
+          explainOnHover(roadLine, 'R layer line = a road or track already mapped in OpenStreetMap. OSRM can usually route only on mapped roads like these.');
+        });
+        document.getElementById('status').textContent=`${data.elements.length.toLocaleString()} mapped roads/tracks loaded.`;
+      }).catch(err => document.getElementById('status').textContent='Road detail could not load: '+err.message);
+  }
+  async function addRouteSegment(destination) {
+    if (routeInFlight) { document.getElementById('status').textContent='Please wait for the current road segment to finish.'; return; }
+    routeInFlight = true;
+    const status=document.getElementById('status'); status.textContent='Adding OSRM road segment…';
+    try {
+      const url=`https://router.project-osrm.org/route/v1/driving/${firstPoint.lng},${firstPoint.lat};${destination.lng},${destination.lat}?overview=full&geometries=geojson`;
+      const data=await (await fetch(url)).json();
+      if (!data.routes || !data.routes.length) throw Error('no usable route');
+      const segment = data.routes[0].geometry.coordinates.map(p => [p[1],p[0]]);
+      if (routePoints.length) segment.shift(); // do not duplicate the joining point
+      rememberAction('add blue route section');
+      routePoints.push(...segment);
+      if (!route) {
+        route=L.polyline(routePoints,{color:'#1967d2',weight:5,opacity:.85}).addTo(map);
+        route.bindTooltip('Blue OSRM route: temporary route following mapped OSM roads. Save it if you want it as a red line.', {sticky:true});
+        explainOnHover(route, 'Blue line = temporary OSRM route. Use Save blue OSRM route to keep it as a red saved road.');
+      } else route.setLatLngs(routePoints);
+      routeDistance += data.routes[0].distance; routeDuration += data.routes[0].duration;
+      firstPoint = destination;
+      if (secondMarker) secondMarker.setLatLng(destination);
+      else secondMarker=L.marker(destination).addTo(map).bindTooltip('Current end of the blue OSRM route. Click another destination to extend the blue route.');
+      explainOnHover(secondMarker, 'Blue marker = current end of the temporary blue OSRM route.');
+      status.textContent=`Route so far: ${(routeDistance/1000).toFixed(1)} km, about ${Math.round(routeDuration/60)} min. Click another destination to continue.`;
+    } catch(e) { status.textContent='No OSRM route was found to that point. The existing route was kept.'; }
+    finally { routeInFlight = false; }
+  }
+  map.on('click', e => {
+    if (drawMode) {
+      draftPoints.push(e.latlng);
+      draftLine.setLatLngs(draftPoints);
+      document.getElementById('status').textContent = `${draftPoints.length} point(s) in this line. Continue clicking, then Finish line.`;
+      return;
+    }
+    if (extendingTraceId) {
+      extendTraceWithOSRM(e.latlng);
+      return;
+    }
+    if (!firstPoint) {
+      rememberAction('set blue route start');
+      firstPoint=e.latlng;
+      firstMarker=L.marker(e.latlng).addTo(map).bindTooltip('Start of the temporary blue OSRM route. Click a destination to draw the first section.').openTooltip();
+      explainOnHover(firstMarker, 'Start marker = beginning of the temporary blue OSRM route.');
+      document.getElementById('status').textContent='Start set. Click destinations one at a time to build one connected route.';
+    }
+    else { addRouteSegment(e.latlng); }
+  });
+  map.on('overlayadd', e => {
+    if (e.layer === roads) loadRoads(true);
+  });
+  map.on('moveend', () => {
+    if (map.hasLayer(roads) && map.getZoom() >= 11) loadRoads();
+  });
+  document.getElementById('clear').onclick=clearBlueRoute;
+  document.getElementById('clearMap').onclick=clearMap;
+  document.getElementById('draw').onclick=() => drawMode ? cancelDrawing() : beginDrawing();
+  document.getElementById('finish').onclick=finishDrawing;
+  document.getElementById('cancel').onclick=()=>cancelDrawing();
+  document.getElementById('continue').onclick=beginTraceExtension;
+  document.getElementById('undo').onclick=restoreLastAction;
+  document.getElementById('trimBefore').onclick=trimTraceBeforePointer;
+  document.getElementById('trim').onclick=trimTraceAfterPointer;
+  document.getElementById('snap').onclick=snapSelectedTraceToOSRM;
+  document.getElementById('delete').onclick=deleteSelectedTrace;
+  document.getElementById('saveRoute').onclick=saveCurrentRoute;
+  document.getElementById('joinPair').onclick=joinSelectedToNearest;
+  document.getElementById('join').onclick=joinRedLines;
+  document.getElementById('export').onclick=exportTraces;
+  document.getElementById('exportKml').onclick=exportGoogleMapsLine;
+  document.getElementById('import').onclick=()=>document.getElementById('importFile').click();
+  document.getElementById('importFile').onchange=e => { if (e.target.files[0]) importTraces(e.target.files[0]); e.target.value=''; };
+  try { savedTraces = JSON.parse(localStorage.getItem(traceStorageKey) || '[]'); } catch (e) { savedTraces = []; }
+  renderTraces(); updateDrawButtons();
+  L.control({position:'bottomleft'}).onAdd = () => { const e=L.DomUtil.create('div','panel legend'); e.innerHTML='<b>Road detail</b><br><i style="background:#e4572e"></i>Main road / N1<br><i style="background:#fff3b0"></i>Local road<br><i style="background:#9a7b4f"></i>Track<br><i style="background:#895b8a"></i>Path'; return e; };
+  // Satellite identifies visible bush tracks; the OSM layer shows mapped roads.
+</script>
+</body>
+</html>
